@@ -85,13 +85,17 @@ QQQ 版策略（见 `buildLeaps` skill）不能直接照搬到个股，三个结
 
 ### 仓位管理
 
+**实现已从早期草案的固定 `max_pos`/`pos_pct` 模型，改为移植自 QQQ 版当前代码的动态部署模型（更成熟、已验证）：**
+
 | 规则 | 说明 |
 |------|------|
-| 每笔仓位 | `pos_pct × 当日 NAV`（默认 5%） |
-| 最大持仓数 | `max_pos`（默认 5 笔） |
-| 满仓轮动 | FIFO — 卖出最早的一笔，买入新信号 |
+| 每笔仓位 | `lot_pct × 当日 NAV`（默认 5%），Mode A 按 `signal_strength()` 在 `lot_pct`–`lot_pct_max` 间动态放大；Mode B 固定用 `lot_pct` |
+| 部署上限 | 期权总市值 ≤ `max_deploy_pct × NAV`（默认 80%），超出时 FIFO 平掉最早仓位腾出空间 |
+| DTE 主动平仓 | 剩余到期时间 < `min_months_remaining`（默认 6 个月）时无条件平仓，避免持有临近到期的合约 |
+| 最短持有期 | `min_hold_months`（默认 3 个月）内不触发止盈，给信号兑现留出时间 |
 | 期权参数 | Delta ≈ `target_delta`（默认 0.6），DTE = `dte_days`（默认 365 天） |
-| 同日多信号 | A、B 同日触发只开一仓（记为 A，因 A 更稀有） |
+| 同日多信号 | A、B 同日触发只开一仓，记为 A（更稀有、更高确信度） |
+| 部分止盈 | `tier1`/`tier2` 支持按 `tpN_close_pct` 部分平仓（默认 100%，可调为分批止盈） |
 
 ### 期权选择（每次入场）
 
@@ -141,30 +145,30 @@ elif months_held ≤ tier3_months and pnl ≥ tier3_profit:     → tier3 止盈
 |------|------|------|
 | AAPL 日线 OHLCV | yfinance → parquet 缓存 | 价格信号、实现波动率 |
 | VIX 日线收盘 | yfinance（`^VIX`） | Mode A 恐慌过滤 |
-| AAPL 历史财报日 | yfinance `earnings_dates` / 手工维护 CSV 兜底 | 财报静默期 |
+| AAPL 历史财报日 | yfinance `Ticker.get_earnings_dates(limit=80)`（实测可回溯至 2002 年）→ CSV 缓存 | 财报静默期 |
 
 回测区间：训练集 2015-01-01 ~ 2024-12-31（含 2018 修正、2020 疫情崩盘、2022 加息熊市），测试集 2025-01-01 ~ 今（完全 OOS）。
 
 ---
 
-## 计划架构
+## 架构（已实现）
 
 ```
 leaps_itm/                     ← git root (~/repo/leaps_itm/)
 ├── strategy/
 │   ├── data.py                — fetch & cache AAPL + VIX + earnings dates
-│   ├── signals.py             — compute_macd(), bullish_divergence(), vix_elevated(),
+│   ├── signals.py             — compute_macd(), bullish_divergence(), vix_elevated(), signal_strength(),
 │   │                            pullback_entry(), iv_rank(), in_earnings_blackout()
 │   ├── options.py             — call_price(), call_delta(), strike_for_delta(), realized_vol()
-│   ├── portfolio.py           — Position dataclass（含 signal_mode 标注）, Portfolio.step(), FIFO
-│   └── metrics.py             — cagr(), max_drawdown(), sharpe(), calmar(), win_rate(), score()
+│   ├── portfolio.py           — Position/Trade（含 signal_mode 标注）, Portfolio.step(), FIFO
+│   └── metrics.py             — cagr(), max_drawdown(), sharpe(), calmar(), win_rate(), score(), summary_by_mode()
 ├── backtest.py                — 回测入口（run() + CLI，--mode A|B|AB）
-├── optimize.py                — 随机参数搜索入口
-├── SKILL.md                   — 本文档
+├── optimize.py                — 随机参数搜索入口（--mode A|B|AB，--refine）
+├── .claude/skills/buildAaplLeaps/SKILL.md  — 本文档
 └── pyproject.toml             — uv 项目依赖
 ```
 
-`options.py`、`metrics.py`、`portfolio.py` 可直接移植自 `~/repo/leaps/leaps/`（QQQ 版），仅 `signals.py` 和 `data.py` 需要扩展。
+`options.py`、`metrics.py`、`portfolio.py` 直接移植自 `~/repo/leaps/leaps/`（QQQ 版最新代码，非早期文档描述的版本——已含动态 lot 定价、DTE 主动平仓、部分止盈等后续演进）。`signals.py` 和 `data.py` 按 Mode B + 财报静默期扩展。
 
 ---
 
@@ -173,38 +177,44 @@ leaps_itm/                     ← git root (~/repo/leaps_itm/)
 ```python
 PARAM_GRID = {
     # 共用
-    "target_delta":       [0.50, 0.55, 0.60, 0.65, 0.70],
-    "dte_days":           [300, 330, 365, 400, 430],
-    "max_pos":            [3, 4, 5, 6],
-    "pos_pct":            [0.03, 0.05, 0.07, 0.10],
-    "earnings_blackout":  [0, 5, 7, 10],          # 0 = 关闭静默期（验证其必要性）
-    "tier1_months":       [3, 4, 5],
-    "tier1_profit":       [0.30, 0.40, 0.50, 0.60],
-    "tier2_months":       [5, 6, 7],
-    "tier2_profit":       [0.20, 0.25, 0.30],
-    "tier3_months":       [8, 9],
-    "tier3_profit":       [0.05, 0.10, 0.15],
-    "force_months":       [9, 10, 12],
+    "target_delta":         [0.50, 0.55, 0.60, 0.65, 0.70],
+    "dte_days":             [300, 330, 365, 400, 430],
+    "lot_pct":              [0.03, 0.05, 0.07, 0.10],
+    "lot_pct_max":          [0.10, 0.15, 0.20, 0.25],   # Mode A dynamic-size ceiling
+    "min_months_remaining": [3, 4, 5, 6],               # DTE proactive-exit threshold
+    "min_hold_months":      [1, 2, 3, 4],
+    "earnings_blackout":    [0, 5, 7, 10],          # 0 = 关闭静默期（验证其必要性）
+    "tier1_months":         [3, 4, 5],
+    "tier1_profit":         [0.30, 0.40, 0.50, 0.60],
+    "tier2_months":         [5, 6, 7],
+    "tier2_profit":         [0.20, 0.25, 0.30],
+    "tier3_months":         [8, 9],
+    "tier3_profit":         [0.05, 0.10, 0.15],
+    "force_months":         [9, 10, 12],
+    "tp1_close_pct":        [0.50, 0.67, 1.00],
+    "tp2_close_pct":        [0.67, 1.00],
 
     # Mode A
-    "macd_fast":          [8, 10, 12, 16],
-    "macd_slow":          [20, 24, 26, 30],
-    "macd_sig":           [7, 9, 12],
-    "div_lookback":       [10, 15, 20, 25],
-    "div_min_gap":        [3, 5, 7],
-    "vix_ma":             [10, 20, 30],
+    "macd_fast":            [8, 10, 12, 16],
+    "macd_slow":            [24, 26, 28, 30],
+    "macd_sig":             [7, 9, 12],
+    "div_lookback":         [10, 15, 20, 25],
+    "div_min_gap":          [3, 5, 7],
+    "vix_ma":               [10, 20, 30],
+    "neg_hist":             [True, False],
 
-    # Mode B
-    "pullback_lookback":  [3, 5, 7],
-    "touch_tolerance":    [0.0, 0.005, 0.01],
-    "hist_converge_days": [2, 3, 4],
-    "iv_rank_max":        [0.30, 0.40, 0.50, 1.00],   # 1.00 = 关闭 IV 过滤（验证其必要性）
+    # Mode B (ma_short/ma_mid/ma_long fixed at 5/20/50, not searched in v1)
+    "pullback_lookback":    [3, 5, 7],
+    "touch_tolerance":      [0.0, 0.005, 0.01],
+    "hist_converge_days":   [2, 3, 4],
+    "iv_rank_max":          [0.30, 0.40, 0.50, 1.00],   # 1.00 = 关闭 IV 过滤（验证其必要性）
 }
 
 # 第一性原理约束（无效组合直接跳过）：
 # tier1_months < tier2_months < tier3_months ≤ force_months
-# macd_fast < macd_slow
+# macd_fast < macd_slow（且差值 ≥ 16，避免快慢线过近产生噪音信号）
 # div_min_gap < div_lookback / 2
+# lot_pct < lot_pct_max
 ```
 
 ---
@@ -284,6 +294,25 @@ uv run backtest.py --mode AB --params best_AB.json --start 2025-01-01
 - **财报静默期是否过滤掉了最好的信号？** 检查历史上财报后暴跌（如 2019-01 业绩预警）的入场机会是否被误伤——blackout 只应挡住财报**前**的入场
 - **tier 时间严格递增** — tier1 < tier2 < tier3 ≤ force
 - **FIFO 轮动 = 自动展期** — 用新的低价合约替换旧合约，是设计取舍
+
+---
+
+## 首次基线结果（默认参数，未调优，仅供 sanity check）
+
+训练期 2015-01-01 ~ 2024-12-31，起始资金 $100,000：
+
+| Mode | CAGR | Max DD | Sharpe | Win Rate | # Trades |
+|------|------|--------|--------|----------|----------|
+| A（底背离反转） | 12.5% | 64.2% | 0.40 | 71.0% | 107 |
+| B（趋势回调续涨） | 25.8% | 32.0% | 0.73 | 93.0% | 71 |
+| AB（组合） | 39.2% | 66.3% | 0.74 | 79.8% | 178（A 107 / B 71，win_rate 与 avg_pnl 各自匹配单模式结果） |
+
+**注意：这些是默认参数下的原始结果，尚未跑 auto-research 搜索，不代表策略的真实上限或下限。** 观察：
+- Mode B 默认参数下 Max DD 明显低于 Mode A（32% vs 64%），初步支持「低 IV 环境买回调」比「高波动环境买反转」风险更低的假设，但样本量小（71 笔）需要参数搜索验证是否稳健
+- Mode A 的 64% 回撤远超「已知局限」中列出的健康范围（<30%），是调参的首要目标
+- AB 组合的 66.3% 回撤由 Mode A 主导，说明简单 OR 合并不会自动继承 B 的低回撤特性——两者共享同一 NAV 部署上限，A 的糟糕仓位会拖累整体
+
+下一步：跑 `optimize.py --mode A`、`--mode B`、`--mode AB` 各 300 次搜索，看 Max DD 能否被压缩到健康区间。
 
 ---
 
