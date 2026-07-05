@@ -63,10 +63,13 @@ class Position:
 class Portfolio:
     def __init__(self, cash: float, max_deploy_pct: float = 0.80):
         self.cash = cash
+        self.initial_cash = cash  # fixed reference for Mode C's basket sizing — never updated as NAV grows/shrinks
         self.max_deploy_pct = max_deploy_pct  # max fraction of NAV in options
         self.positions: list[Position] = []
         self.trades: list[Trade] = []
         self.curve: list[tuple[date, float]] = []
+        self.last_entry_date: date | None = None  # for fixed_sizing entry cooldown
+        self.last_exit_date: date | None = None   # for fixed_sizing exit cooldown
 
     # ── valuation ─────────────────────────────────────────────────────────────
 
@@ -101,6 +104,21 @@ class Portfolio:
         self.positions.remove(pos)
         self.trades.append(Trade(pos.entry_date, d, pos.entry_premium, exit_premium, pnl, reason, pos.shares, pos.signal_mode))
 
+    def _roll(self, pos: Position, d: date, S: float, sigma: float, params: dict, in_death_cross: bool):
+        """Close a losing position at the DTE floor and immediately reopen the
+        same contract count at a fresh expiry (Mode C only) — instead of
+        realizing the loss, give it more time. Uses dte_days_bear if still in
+        a death cross, else the standard dte_days. If the roll can't be
+        afforded (liquidation proceeds too small), it silently falls back to
+        a plain close via _open()'s own cash check.
+        """
+        contracts = pos.contracts
+        signal_mode = pos.signal_mode
+        self._close(pos, d, S, sigma, "roll")
+        new_dte = params.get("dte_days_bear", params["dte_days"]) if in_death_cross else params["dte_days"]
+        roll_params = {**params, "dte_days": new_dte, "lot_size": contracts}
+        self._open(d, S, sigma, roll_params, signal_mode=signal_mode)
+
     def _partial_close(self, pos: Position, d: date, S: float, sigma: float, reason: str, close_pct: float):
         contracts_to_close = max(1, round(pos.contracts * close_pct))
         if contracts_to_close >= pos.contracts:
@@ -116,39 +134,121 @@ class Portfolio:
 
     # ── daily step ─────────────────────────────────────────────────────────────
 
-    def step(self, d: date, S: float, sigma: float, signal: str | None, params: dict) -> float:
+    def step(
+        self, d: date, S: float, sigma: float, signal: str | None, params: dict,
+        exit_signal: bool = False, in_death_cross: bool = False,
+    ) -> float:
         """Process one trading day. Returns end-of-day NAV.
 
-        `signal` is None (no entry today) or a string signal_mode ("A"/"B")
+        `signal` is None (no entry today) or a string signal_mode ("A"/"B"/"C")
         naming which mode fired. If both fired on the same day, the caller
         resolves priority before calling step() (Mode A wins — see backtest.py).
+
+        `exit_signal` is only consulted for `fixed_sizing` (Mode C) positions —
+        True means today's price structure (price > MA5 > MA20) permits taking
+        profit, subject to the per-position profit floor and weekly throttle.
+
+        `in_death_cross` is only consulted for `fixed_sizing` positions hitting
+        the DTE floor while underwater — see `dte_roll_losers` below.
         """
         max_dep = params.get("max_deploy_pct", self.max_deploy_pct)
         min_rem = params.get("min_months_remaining", 6)
 
-        # 1. DTE exit: proactively sell when < min_months_remaining to expiry
+        # 1. DTE exit: proactively sell when < min_months_remaining to expiry.
+        # Mode C: a losing position can instead be rolled to a fresh expiry
+        # (dte_roll_losers) — gives it more time to recover rather than
+        # realizing the loss, mirroring the bear-regime DTE extension on entry.
         for pos in list(self.positions):
             if pos.months_to_expiry(d) < min_rem:
-                self._close(pos, d, S, sigma, "dte")
-
-        # 2. Tiered profit / force exits
-        for pos in list(self.positions):
-            months = pos.months_held(d)
-            pnl = pos.pnl_pct(d, S, sigma)
-            reason = _exit_reason(months, pnl, params, pos.used_tiers)
-            if reason:
-                close_pct = params.get(f"{reason}_close_pct", 1.0) if reason.startswith("tp") else 1.0
-                if close_pct < 1.0:
-                    self._partial_close(pos, d, S, sigma, reason, close_pct)
+                if (
+                    params.get("fixed_sizing", False)
+                    and params.get("dte_roll_losers", False)
+                    and pos.pnl_pct(d, S, sigma) < 0
+                ):
+                    self._roll(pos, d, S, sigma, params, in_death_cross)
                 else:
-                    self._close(pos, d, S, sigma, reason)
+                    self._close(pos, d, S, sigma, "dte")
+
+        # 1b. Stop-loss exit (Mode C only): cuts a losing position immediately
+        # once it breaches stop_loss_pct, independent of the exit signal, FIFO
+        # ordering, and the weekly sell cooldown — a risk cut, not profit-taking.
+        if params.get("fixed_sizing", False):
+            stop_loss = params.get("stop_loss_pct")
+            if stop_loss is not None:
+                for pos in list(self.positions):
+                    if pos.pnl_pct(d, S, sigma) <= -stop_loss:
+                        self._close(pos, d, S, sigma, "stop_loss")
+
+        # 2. Profit-taking exits
+        if params.get("fixed_sizing", False):
+            # Mode C: FIFO — only the oldest position eligible for profit-taking
+            # closes, throttled to one sale per exit_cooldown_days.
+            cooldown_days = params.get("exit_cooldown_days", 7)
+            cooldown_ok = (
+                self.last_exit_date is None
+                or (d - self.last_exit_date).days >= cooldown_days
+            )
+            if exit_signal and cooldown_ok and self.positions:
+                profit_min = params.get("exit_profit_min", 0.20)
+                eligible = [p for p in self.positions if p.pnl_pct(d, S, sigma) > profit_min]
+                if eligible:
+                    oldest = min(eligible, key=lambda p: p.entry_date)
+                    self._close(oldest, d, S, sigma, "signal_tp")
+                    self.last_exit_date = d
+        else:
+            # Mode A/B: tiered profit / force exits by holding period
+            for pos in list(self.positions):
+                months = pos.months_held(d)
+                pnl = pos.pnl_pct(d, S, sigma)
+                reason = _exit_reason(months, pnl, params, pos.used_tiers)
+                if reason:
+                    close_pct = params.get(f"{reason}_close_pct", 1.0) if reason.startswith("tp") else 1.0
+                    if close_pct < 1.0:
+                        self._partial_close(pos, d, S, sigma, reason, close_pct)
+                    else:
+                        self._close(pos, d, S, sigma, reason)
 
         # 3. Record NAV
         current_nav = self.nav(d, S, sigma)
         self.curve.append((d, current_nav))
 
-        # 4. Entry: compute whole contracts from NAV × lot_pct, FIFO if over cap
-        if signal:
+        # 4. Entry
+        if signal and params.get("fixed_sizing", False):
+            # Basket sizing: the total budget (initial_cash × max_deploy_pct,
+            # fixed at day 1 — never recalculated off a growing NAV, which is
+            # what caused runaway position sizes in an earlier iteration) is
+            # split into n_baskets equal dollar chunks. Each entry (throttled
+            # to one per entry_cooldown_days, "one basket/week") spends one
+            # basket's worth of cash on as many whole contracts as it buys —
+            # so a cheap contract (2015-era AAPL) fills a basket with more
+            # contracts than an expensive one (2025-era), without the lot
+            # size compounding as the account grows. An explicit
+            # contracts_per_entry still overrides with a literal fixed count.
+            cooldown_days = params.get("entry_cooldown_days", 7)
+            cooldown_ok = (
+                self.last_entry_date is None
+                or (d - self.last_entry_date).days >= cooldown_days
+            )
+            if cooldown_ok:
+                T = params["dte_days"] / 365.0
+                K = strike_for_delta(S, T, sigma, params["target_delta"])
+                premium = call_price(S, K, T, sigma)
+                override = params.get("contracts_per_entry")
+                if override:
+                    lot = override
+                elif premium > 0:
+                    n_baskets = params.get("n_baskets", 10)
+                    basket_dollars = self.initial_cash * max_dep / n_baskets
+                    lot = max(1, int(basket_dollars / (premium * 100)))
+                else:
+                    lot = 0
+                if lot > 0:
+                    lot_cost = lot * 100 * premium
+                    deploy_ok = self.option_value(d, S, sigma) + lot_cost <= current_nav * max_dep
+                    if deploy_ok and self._open(d, S, sigma, {**params, "lot_size": lot}, signal_mode=signal):
+                        self.last_entry_date = d
+        elif signal:
+            # Dynamic NAV%-based sizing, FIFO rotation under a deploy cap.
             T = params["dte_days"] / 365.0
             K = strike_for_delta(S, T, sigma, params["target_delta"])
             premium = call_price(S, K, T, sigma)

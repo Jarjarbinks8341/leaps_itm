@@ -78,10 +78,13 @@ def score(
 
     Normalizes each metric to a comparable scale before weighting.
     Higher is always better (max_dd is negated).
-    Weights: cagr=0.40, neg_dd=0.30, sharpe=0.20, calmar=0.10
+    Weights: cagr=0.35, neg_dd=0.35, sharpe=0.20, calmar=0.10
+    (shifted 5% from cagr to neg_dd on 2026-07-05 — the optimizer kept
+    exploiting raw CAGR at the expense of drawdown; see SKILL.md Mode AB
+    overfitting diagnosis)
     """
     if weights is None:
-        weights = {"cagr": 0.40, "neg_dd": 0.30, "sharpe": 0.20, "calmar": 0.10}
+        weights = {"cagr": 0.35, "neg_dd": 0.35, "sharpe": 0.20, "calmar": 0.10}
 
     c = cagr(curve)
     dd = max_drawdown(curve)
@@ -94,6 +97,20 @@ def score(
         + weights.get("sharpe", 0) * s / 5.0      # Sharpe ~0–5 → 0–1
         + weights.get("calmar", 0) * cal / 10.0   # Calmar ~0–10 → 0–1
     )
+
+
+def overfit_penalty(cagr_train: float, cagr_oos: float, tolerance: float = 0.10, weight: float = 1.0) -> float:
+    """Penalize a train/OOS CAGR gap beyond `tolerance`.
+
+    Mirrors the manual "training vs OOS CAGR 差值 > 20% = overfitting" check
+    from SKILL.md's Auto-Research protocol, but applied continuously inside
+    the optimizer's score instead of only as an after-the-fact human review —
+    added 2026-07-05 after two rounds of PARAM_GRID tightening failed to stop
+    the optimizer from picking params that inflate training CAGR without
+    holding up OOS (see SKILL.md Mode AB overfitting diagnosis).
+    """
+    gap = abs(cagr_train - cagr_oos)
+    return weight * max(0.0, gap - tolerance)
 
 
 def summary_by_mode(trades: list[Trade]) -> dict[str, dict]:

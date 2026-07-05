@@ -30,6 +30,9 @@ from strategy.signals import (
     pullback_entry,
     iv_rank,
     in_earnings_blackout,
+    deep_pullback_entry,
+    deep_rally_exit,
+    death_cross_regime,
 )
 
 DEFAULT_PARAMS: dict = {
@@ -68,6 +71,40 @@ DEFAULT_PARAMS: dict = {
     "ma_long": 50,
 }
 
+# Mode C — simplified deep-pullback: entry on price < MA5 < MA20. Position
+# budget = initial_cash × max_deploy_pct (fixed at $50k for a $100k account,
+# never recalculated off NAV growth), split into n_baskets equal dollar
+# baskets (default 10 × $5k). At most one entry per week spends one basket's
+# worth of cash on as many whole contracts as it buys — cheap contracts (2015)
+# fill a basket with more contracts than expensive ones (2025), so sizing
+# scales with price without compounding with NAV. Exit FIFO on price > MA5 >
+# MA20 with per-position profit > 35% (max 1 sale/week — "sell by basket,
+# FIFO"), or forced at 6 months before expiry regardless of P&L. tier1/2/3 and
+# force_months from DEFAULT_PARAMS are unused here — Mode C's fixed_sizing
+# branch in portfolio.step() replaces the tiered/_exit_reason exit path
+# entirely, and lot_pct (the NAV%-based sizing A/B use) is unused too.
+DEFAULT_PARAMS_C: dict = {
+    **DEFAULT_PARAMS,
+    "target_delta": 0.80,
+    "dte_days": 365,
+    "min_months_remaining": 6,
+    "fixed_sizing": True,
+    "contracts_per_entry": None,  # None = size from the basket budget below; set an int to force a fixed count
+    "n_baskets": 10,
+    "entry_cooldown_days": 7,
+    "max_deploy_pct": 0.50,   # total budget = 50% of initial capital, split across n_baskets
+    "exit_profit_min": 0.35,
+    "stop_loss_pct": None,    # e.g. 0.30 = close immediately at -30% P&L; None disables (tested 2026-07-05, not adopted — see SKILL.md)
+    "death_cross_filter": False,  # block new entries while MA50 < MA200; tested 2026-07-05, not adopted — see SKILL.md
+    "ma_death_mid": 50,
+    "ma_death_long": 200,
+    "dte_days_bear": 913,     # ~2.5yr — DTE used instead of dte_days when an entry opens during a death cross (MA50<MA200); the longest LEAPS commonly listed. None disables. Tested 2026-07-05, adopted — see SKILL.md
+    "dte_roll_losers": False,  # roll a losing position at the DTE floor into a fresh expiry instead of realizing the loss; tested 2026-07-05, not adopted (spikes Max DD to 68%) — see SKILL.md
+    "exit_cooldown_days": 7,
+    "ma_short": 5,
+    "ma_mid": 20,
+}
+
 INITIAL_CASH = 100_000.0
 
 
@@ -85,10 +122,10 @@ def run(
 
     Returns metrics dict including curve, trades, and (for AB) by-mode attribution.
     """
-    if mode not in ("A", "B", "AB"):
-        raise ValueError(f"mode must be 'A', 'B', or 'AB', got {mode!r}")
+    if mode not in ("A", "B", "AB", "C"):
+        raise ValueError(f"mode must be 'A', 'B', 'AB', or 'C', got {mode!r}")
     if params is None:
-        params = DEFAULT_PARAMS
+        params = DEFAULT_PARAMS_C if mode == "C" else DEFAULT_PARAMS
     if data is None:
         data = load(refresh=refresh, ticker=ticker)
     if earnings_dates is None:
@@ -106,6 +143,8 @@ def run(
 
     use_a = mode in ("A", "AB")
     use_b = mode in ("B", "AB")
+    use_c = mode == "C"
+    warmup_c = params["ma_mid"]
 
     for d, row in sub.iterrows():
         global_i = data.index.get_loc(d)
@@ -142,6 +181,33 @@ def run(
             )
             sig_b = pullback and iv_rank(p_full) < params["iv_rank_max"]
 
+        sig_c = False
+        sig_c_exit = False
+        in_death_cross = False
+        if use_c:
+            # Death-cross regime flag (MA50 < MA200): computed unconditionally
+            # so it's available both for the (disabled-by-default) entry
+            # filter below and for the DTE selection further down — buying a
+            # longer-dated LEAPS when opening a position during a bear regime
+            # gives a prolonged correction (e.g. 2015-2016) more room to
+            # recover before the DTE-proactive-exit forces a sale. See
+            # death_cross_regime() and SKILL.md Mode C.
+            ma_death_long = params.get("ma_death_long", 200)
+            if global_i >= ma_death_long - 1:
+                p_death_win = data["price"].iloc[global_i - ma_death_long + 1 : global_i + 1]
+                in_death_cross = death_cross_regime(
+                    p_death_win, params.get("ma_death_mid", 50), ma_death_long
+                )
+            blocked_by_death_cross = params.get("death_cross_filter", False) and in_death_cross
+
+            if global_i >= warmup_c:
+                p_win = data["price"].iloc[global_i - warmup_c + 1 : global_i + 1]
+                if not blackout and not blocked_by_death_cross:
+                    sig_c = deep_pullback_entry(p_win, params["ma_short"], params["ma_mid"])
+                # Exit signal is not blocked by earnings blackout or death
+                # cross — both only gate new entries.
+                sig_c_exit = deep_rally_exit(p_win, params["ma_short"], params["ma_mid"])
+
         # Same-day overlap: Mode A takes priority (rarer, higher-conviction signal)
         signal: str | None = None
         step_params = params
@@ -152,8 +218,12 @@ def run(
             step_params = {**params, "lot_pct": lo + (hi - lo) * strength}
         elif sig_b:
             signal = "B"
+        elif sig_c:
+            signal = "C"
+            if in_death_cross and params.get("dte_days_bear") is not None:
+                step_params = {**params, "dte_days": params["dte_days_bear"]}
 
-        pf.step(d, S, sigma, signal, step_params)
+        pf.step(d, S, sigma, signal, step_params, exit_signal=sig_c_exit, in_death_cross=in_death_cross)
 
     m = summary(pf.curve, pf.trades)
     m["curve"] = pf.curve
@@ -225,7 +295,7 @@ def _print_report(m: dict, mode: str, start: str, end: str, ticker: str, show_tr
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="AAPL LEAPS backtest")
-    parser.add_argument("--mode", default="A", choices=["A", "B", "AB"], help="Entry signal mode")
+    parser.add_argument("--mode", default="A", choices=["A", "B", "AB", "C"], help="Entry signal mode")
     parser.add_argument("--start", default="2015-01-01")
     parser.add_argument("--end", default="2024-12-31")
     parser.add_argument("--refresh", action="store_true", help="Re-download price/earnings data")
@@ -234,7 +304,7 @@ def main() -> None:
     parser.add_argument("--trades", action="store_true", help="Print individual trade log")
     args = parser.parse_args()
 
-    params = dict(DEFAULT_PARAMS)
+    params = dict(DEFAULT_PARAMS_C if args.mode == "C" else DEFAULT_PARAMS)
     if args.params:
         with open(args.params) as f:
             params.update(json.load(f))

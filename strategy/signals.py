@@ -226,6 +226,75 @@ def pullback_entry(
     return True
 
 
+# ── Mode C: deep pullback (simplified) ──────────────────────────────────────
+
+
+def deep_pullback_entry(
+    prices: pd.Series,
+    ma_short: int = 5,
+    ma_mid: int = 20,
+) -> bool:
+    """Mode C entry: price < MA5 < MA20 — today's close sits below both the
+    short and long moving average, with the short average itself already
+    below the long one. See SKILL.md Mode C.
+    """
+    n = len(prices)
+    if n < ma_mid:
+        return False
+
+    ma5_now = float(prices.iloc[-ma_short:].mean())
+    ma20_now = float(prices.iloc[-ma_mid:].mean())
+    price_now = float(prices.iloc[-1])
+
+    return price_now < ma5_now < ma20_now
+
+
+def deep_rally_exit(
+    prices: pd.Series,
+    ma_short: int = 5,
+    ma_mid: int = 20,
+) -> bool:
+    """Mode C exit signal: price > MA5 > MA20 — the mirror image of
+    deep_pullback_entry(), confirming an established uptrend. Combined by the
+    caller with a per-position profit threshold and a FIFO/weekly throttle.
+    See SKILL.md Mode C.
+    """
+    n = len(prices)
+    if n < ma_mid:
+        return False
+
+    ma5_now = float(prices.iloc[-ma_short:].mean())
+    ma20_now = float(prices.iloc[-ma_mid:].mean())
+    price_now = float(prices.iloc[-1])
+
+    return price_now > ma5_now > ma20_now
+
+
+def death_cross_regime(
+    prices: pd.Series,
+    ma_mid: int = 50,
+    ma_long: int = 200,
+) -> bool:
+    """True if MA50 < MA200 — a macro bear-regime flag ("death cross"),
+    independent of the short-term MA5/MA20 entry/exit signals.
+
+    Backtest evidence (AAPL 2015-2024): Mode C trades whose holding period
+    overlapped a death-cross regime had a 56% win rate / +10.5% avg P&L /
+    -85.6% worst trade, vs 99% / +45.4% / -34.0% for trades held entirely in
+    a MA50>MA200 regime — nearly all of the strategy's worst losses (29/35 in
+    2015-2016, 14/15 in 2022) occurred during or across a death cross. See
+    SKILL.md Mode C.
+    """
+    n = len(prices)
+    if n < ma_long:
+        return False
+
+    ma_mid_now = float(prices.iloc[-ma_mid:].mean())
+    ma_long_now = float(prices.iloc[-ma_long:].mean())
+
+    return ma_mid_now < ma_long_now
+
+
 # ── Shared ───────────────────────────────────────────────────────────────────
 
 
