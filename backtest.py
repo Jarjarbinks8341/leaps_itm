@@ -39,6 +39,7 @@ DEFAULT_PARAMS: dict = {
     # shared
     "target_delta": 0.60,
     "dte_days": 365,
+    "dte_days_bear": None,  # e.g. 545 (~18mo) — DTE used instead of dte_days when an entry (any mode) opens during a death cross (MA50<MA200); None disables
     "lot_pct": 0.05,
     "lot_pct_max": 0.15,
     "min_months_remaining": 6,
@@ -181,25 +182,24 @@ def run(
             )
             sig_b = pullback and iv_rank(p_full) < params["iv_rank_max"]
 
+        # Death-cross regime flag (MA50 < MA200): computed unconditionally for
+        # every mode, not just C — it drives the dte_days_bear override below
+        # (buying a longer-dated LEAPS when opening a position during a bear
+        # regime gives a prolonged correction, e.g. 2015-2016, more room to
+        # recover before the DTE-proactive-exit forces a sale) as well as
+        # Mode C's own entry filter. See death_cross_regime() and SKILL.md.
+        in_death_cross = False
+        ma_death_long = params.get("ma_death_long", 200)
+        if global_i >= ma_death_long - 1:
+            p_death_win = data["price"].iloc[global_i - ma_death_long + 1 : global_i + 1]
+            in_death_cross = death_cross_regime(
+                p_death_win, params.get("ma_death_mid", 50), ma_death_long
+            )
+
         sig_c = False
         sig_c_exit = False
-        in_death_cross = False
         if use_c:
-            # Death-cross regime flag (MA50 < MA200): computed unconditionally
-            # so it's available both for the (disabled-by-default) entry
-            # filter below and for the DTE selection further down — buying a
-            # longer-dated LEAPS when opening a position during a bear regime
-            # gives a prolonged correction (e.g. 2015-2016) more room to
-            # recover before the DTE-proactive-exit forces a sale. See
-            # death_cross_regime() and SKILL.md Mode C.
-            ma_death_long = params.get("ma_death_long", 200)
-            if global_i >= ma_death_long - 1:
-                p_death_win = data["price"].iloc[global_i - ma_death_long + 1 : global_i + 1]
-                in_death_cross = death_cross_regime(
-                    p_death_win, params.get("ma_death_mid", 50), ma_death_long
-                )
             blocked_by_death_cross = params.get("death_cross_filter", False) and in_death_cross
-
             if global_i >= warmup_c:
                 p_win = data["price"].iloc[global_i - warmup_c + 1 : global_i + 1]
                 if not blackout and not blocked_by_death_cross:
@@ -220,8 +220,13 @@ def run(
             signal = "B"
         elif sig_c:
             signal = "C"
-            if in_death_cross and params.get("dte_days_bear") is not None:
-                step_params = {**params, "dte_days": params["dte_days_bear"]}
+
+        # Bear-regime DTE extension applies uniformly across A/B/C — an entry
+        # opened during a death cross buys dte_days_bear (e.g. 18mo) instead
+        # of the regular dte_days (e.g. 12mo); None (the default for A/B)
+        # leaves them on a single fixed DTE, unaffected.
+        if signal and in_death_cross and params.get("dte_days_bear") is not None:
+            step_params = {**step_params, "dte_days": params["dte_days_bear"]}
 
         pf.step(d, S, sigma, signal, step_params, exit_signal=sig_c_exit, in_death_cross=in_death_cross)
 

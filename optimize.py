@@ -37,7 +37,8 @@ from backtest import run, DEFAULT_PARAMS
 PARAM_GRID: dict[str, list] = {
     # shared
     "target_delta": [0.50, 0.55, 0.60, 0.65, 0.70],
-    "dte_days": [300, 330, 365, 400, 430],
+    "dte_days": [300, 330, 365, 400, 430, 545, 730, 913],  # 2026-07-06 extended to ~2.5yr (913d) — was capped at ~14mo
+    "dte_days_bear": [None, 430, 545, 640, 730],  # 2026-07-06 added — regime-adaptive DTE: use this instead of dte_days when an entry opens during a death cross (MA50<MA200); None = single fixed DTE regardless of regime
     "lot_pct": [0.03, 0.05, 0.07],
     "lot_pct_max": [0.10, 0.15, 0.20, 0.25],
     "min_months_remaining": [3, 4, 5, 6],
@@ -97,9 +98,18 @@ def _make_neighborhood(base: dict) -> dict[str, list]:
     def _ints(v, steps, lo=1):
         return sorted({max(lo, v + d) for d in steps})
 
+    def _dte_bear_neighborhood(v):
+        # v may be None (single fixed DTE) — keep that option plus a few
+        # concrete bear-DTE values to explore around, rather than crashing
+        # sorted() on a None/int mix.
+        if v is None:
+            return [None, 430, 545, 640, 730]
+        return [None, *_ints(v, [-90, -30, 0, 30, 90], lo=380)]
+
     spec: dict[str, list] = {
         "target_delta": _floats(base["target_delta"], [-0.10, -0.05, 0, 0.05, 0.10], lo=0.30, hi=0.85),
         "dte_days": _ints(base["dte_days"], [-60, -30, 0, 30, 60], lo=180),
+        "dte_days_bear": _dte_bear_neighborhood(base.get("dte_days_bear")),
         "lot_pct": _floats(base["lot_pct"], [-0.02, -0.01, 0, 0.01, 0.02], lo=0.01, hi=0.30),
         "lot_pct_max": _floats(base["lot_pct_max"], [-0.05, -0.02, 0, 0.02, 0.05], lo=0.03, hi=0.50),
         "min_months_remaining": _ints(base["min_months_remaining"], [-2, -1, 0, 1, 2], lo=1),
