@@ -73,6 +73,7 @@ def score(
     curve: list[tuple[date, float]],
     trades: list[Trade],
     weights: dict | None = None,
+    cagr_cap: float | None = 0.40,
 ) -> float:
     """Composite score for parameter optimization.
 
@@ -82,17 +83,24 @@ def score(
     (shifted 5% from cagr to neg_dd on 2026-07-05 — the optimizer kept
     exploiting raw CAGR at the expense of drawdown; see SKILL.md Mode AB
     overfitting diagnosis)
+
+    `cagr_cap` (default 0.40, added 2026-07-06) caps the CAGR term's
+    contribution once CAGR clears a "good enough" threshold — 30-40%/yr is
+    already a strong result for this strategy, so further CAGR stops moving
+    the score and the optimizer's remaining leverage is Max DD/Sharpe/Calmar.
+    Pass None to score raw (uncapped) CAGR, e.g. for reporting.
     """
     if weights is None:
         weights = {"cagr": 0.35, "neg_dd": 0.35, "sharpe": 0.20, "calmar": 0.10}
 
     c = cagr(curve)
+    c_scored = min(c, cagr_cap) if cagr_cap is not None else c
     dd = max_drawdown(curve)
     s = sharpe(curve)
     cal = calmar(curve)
 
     return (
-        weights.get("cagr", 0) * c
+        weights.get("cagr", 0) * c_scored
         + weights.get("neg_dd", 0) * (-dd)
         + weights.get("sharpe", 0) * s / 5.0      # Sharpe ~0–5 → 0–1
         + weights.get("calmar", 0) * cal / 10.0   # Calmar ~0–10 → 0–1

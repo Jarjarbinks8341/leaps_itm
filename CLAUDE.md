@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project purpose
 
-Automated LEAPS buy-signal strategy for AAPL (later MSFT, GOOGL), validated by backtesting against historical data with auto-research parameter tuning.
+Automated LEAPS buy-signal strategy for AAPL, extended to MSFT (2026-07-06, `--ticker MSFT` — see SKILL.md "MSFT 扩展验证": params don't transfer across tickers, re-run optimize.py per ticker) and eventually GOOGL, validated by backtesting against historical data with auto-research parameter tuning.
 
 ## Strategy specification
 
@@ -33,7 +33,7 @@ There is no test suite yet (no pytest config). `backtest.py --trades` and manual
 - `strategy/portfolio.py` — `Position`/`Trade` (tagged with `signal_mode` for A/B/C attribution), `Portfolio.step()` handling DTE exits for all modes plus two mutually-exclusive profit-exit paths: tiered `_exit_reason()` (A/B) or FIFO signal-gated exit throttled to one sale/week (`fixed_sizing=True`, Mode C); entries likewise branch between NAV%-based FIFO rotation with an 80%-of-NAV cap (A/B) and Mode C's basket sizing — `Portfolio.initial_cash` (fixed at construction) × `max_deploy_pct` ÷ `n_baskets` gives a fixed dollar budget per entry, converted to whole contracts at the day's option cost, throttled to one entry/week (`contracts_per_entry` can still override to a fixed count); `Portfolio._roll()` implements an optional (disabled-by-default) DTE-floor rollover for losing Mode C positions
 - `strategy/metrics.py` — CAGR/drawdown/Sharpe/Calmar/win-rate/composite score, plus `summary_by_mode()` for AB attribution
 - `backtest.py` — CLI entry point, takes `--mode A|B|AB|C`
-- `optimize.py` — CLI entry point, takes `--mode A|B|AB` (Mode C not yet in the search space); every trial is backtested on both train and OOS windows and ranked by `train_score - overfit_penalty(train_cagr, oos_cagr)` (`strategy/metrics.py`), default OOS window is train_end+1 day through the latest cached data — pass `--no-oos-penalty` for the old training-score-only ranking
+- `optimize.py` — CLI entry point, takes `--mode A|B|AB` (Mode C not yet in the search space); every trial is backtested on both train and OOS windows and ranked by `train_score - overfit_penalty(train_cagr, oos_cagr)` (`strategy/metrics.py`), default OOS window is train_end+1 day through the latest cached data — pass `--no-oos-penalty` for the old training-score-only ranking. `score()`'s CAGR term is capped at 40% by default (`cagr_cap`, applies everywhere including `backtest.py`'s printed Score) so the optimizer can't keep buying more CAGR with more Max DD once it's already "good enough" — see SKILL.md
 
 `options.py`, `portfolio.py`, and `metrics.py` were ported near-verbatim from the QQQ LEAPS reference implementation at `~/repo/leaps/leaps/` — check there first when debugging BSM pricing or exit-tier logic, since that codebase has more historical iteration behind it.
 
